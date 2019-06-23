@@ -1,89 +1,243 @@
-#version on Spark Master that is working
+#This file is for managing the cleaning of historical data
 import sys
-
+import os
+from argparse import ArgumentParser
 from pyspark import SparkContext, SparkConf
 from pyspark.sql import SparkSession
+from pyspark.sql.types import IntegerType, DateType
+from pyspark.sql import functions as func
+from pyspark.sql.functions import lit, to_date, col, when
+
 import pgConnector
 
+input_path = 's3a://ritu-insight-project/'
+
 def initSession():
-    ss = SparkSession.builder.appName("TestSpark").getOrCreate()
+    ss = SparkSession.builder.appName("MonthlyUploadAgg")\
+    .config("spark.sql.codegen.wholeStage", "true").getOrCreate()
     return ss
 
 def initDbConnection():
     conn = pgConnector.PostgresConnector()
     return conn
 
+def getHour(filename):
+    return int(fileName.split('.')[-2].split('-')[-1])
 
-def processPushEvent(df):
+# At the end of the day all cleaned hourly files will be read and data will be
+# grouped together
+def processDayEnd(df, type, fileName, numCount):
+        filestoread=fileName.split('.')[-2][:-3]
+        df_read = ss.read.csv(type + filestoread + "*.csv")
+        newcolnames = ['events','repo_name','count']
+        df_read=df_read.toDF(*newcolnames)
+        df_read = df_read.withColumn('count', df_read["count"].cast(IntegerType()))
+        df_combine = df.union(df_read)
+        df_combine = df_combine.groupBy("event", "repo_name").agg(func.sum("count"))
+        df_combine = df_combine.withColumnRenamed("sum(count)", "count")
+        df_combine = df_combine.withColumn('create_date', lit(filestoread))
+        df_combine = df_combine.withColumn('create_date', df_combine["create_date"].cast(DateType()))
+        df_combine = df_combine.sort("count", ascending=False).limit(50)
+        writeUsersToPostgres(df_combine, type+"_table", "append")
+        return df_combine
+
+# extract the repo info from pull request event
+def processPullRequestEvent(df, fileName):
+    try:
+        df = df[df.type.isin('PullRequestEvent')]
+    except:
+        print('extracting rows with PullRequestEvent Failed')
+    try:
+        df = df.withColumn('repo_name', df['repo']['name']).withColumn('repo', df['payload']['pull_request']['head']['repo'])
+    except:
+        print('extracting repo_name, payload PullRequestEvent columns Failed')
+    try:
+        df = df.select('repo_name', 'repo')
+        df = df.na.drop()
+    except:
+        print('selecting PullRequestEvent cols Failed for repo_name, repo')
+    try:
+        df = df.withColumn('language', df['repo']['language']).withColumn('open_issues_count', df['repo']['open_issues_count'])
+    except:
+        print("error extracting language, open_issues_count")
+    try:
+        df = df.withColumn('forks', df['repo']['forks']).withColumn('has_wiki', df['repo']['has_wiki'])
+    except:
+        print("error extracting forks, has_wiki")
+    try:
+        df = df.withColumn('stars_count', df['repo']['stargazers_count']).withColumn('watchers', df['repo']['watchers_count'])
+    except:
+        print('extracting stars, watchers Failed')
+    df.na.drop()
+    try:
+        df = df.select('repo_name', 'language', 'open_issues_count', 'has_wiki', 'forks', 'stars_count', 'watchers')
+    except:
+        print('selecting PullRequestEvent cols Failed')
+    df = df.drop('repo')
+
+    df = df.where(col("language").isNotNull())
+    #df = df.dropDuplicates(['repo_name']) #THIS SHOULD CHANGE, AGG LANGUAGE
+
+    df_agg_langs = df.select('repo_name', 'language').dropDuplicates().groupby("repo_name").agg(func.collect_list("language").alias("languages"))
+    df_agg = df.join(df_agg_langs, on='repo_name', how='inner').drop('language')
+    filestr = fileName.split('.')[-2]
+    try:
+        df_agg.write.json("PullReqEvent" + filestr + ".json")
+    except:
+        print("file PullReqEvent" + filestr + ".json" + "already exists")
+
+    str = getHour(fileName)
+    if str == 23:
+        filestoread=fileName.split('.')[-2][:-3]
+        df_read = ss.read.json("PullReqEvent" + filestoread + "*.json")
+        return df_read
+
+
+
+# extract the user information from push event
+def processPushEventUsers(df, fileName):
     try:
         df = df[df.type.isin('PushEvent')]
     except:
         print('extracting rows with PushEvent Failed')
     try:
-        df = df.withColumn('event', df['type']).withColumn('create_time', df['created_at']).withColumn('repo_name', df['repo']['name']).withColumn('user_name', df['actor']['login'])
+        df = df.withColumn('repo_name', df['repo']['name']).withColumn('user_name', df['actor']['login'])
     except:
         print('extracting Pushevent columns Failed')
     try:
-        df = df.withColumn('event', df['type']).withColumn('create_time', df['created_at']).withColumn('repo_name', df['repo']['name']).withColumn('user_name', df['actor']['login'])
-    except:
-        print('extracting Pushevent columns Failed')
-    try:
-        df = df.select('event', 'create_time', 'repo_name', 'user_name')
+        df = df.select('repo_name', 'user_name')
     except:
         print('selecting PushEvent cols Failed')
-    print("$$$$$$$$$$$$$$$$$$$", df.head())
-    return df
 
-def processWatchEvent(df):
+    df = df.groupBy('repo_name', 'user_name').count()
+
+    df = df.filter(df['count']>10)
+    str = getHour(fileName)
+    if str != 23:
+        filestr = fileName.split('.')[-2]
+        try:
+            df.write.csv("PushEventUser" + filestr + ".csv")
+        except:
+            print("file PushEventUser" + filestr + ".csv" + "already exists")
+
+    else:
+        filestoread=fileName.split('.')[-2][:-3]
+        df_read = ss.read.csv("PushEventUser" + filestoread + "*.csv")
+        newcolnames = ['repo_name','user_name', 'count']
+        df_read=df_read.toDF(*newcolnames)
+        df_read = df_read.withColumn('count', df_read["count"].cast(IntegerType()))
+        df_combine = df.union(df_read)
+        df_combine = df_combine.groupBy("repo_name", "user_name").agg(func.sum("count"))
+        df_combine = df_combine.withColumnRenamed("sum(count)", "count")
+        df_combine = df_combine.withColumn('create_date', lit(filestoread))
+        df_combine = df_combine.withColumn('create_date', df_combine["create_date"].cast(DateType()))
+        df_combine=df_combine.sort("count", ascending=False).limit(50)
+        writeUsersToPostgres(df_combine, "repo_users", "append")
+
+
+
+# extract any event to find out how many events of that kind occured in an hour on each repo_name
+#       df - file loaded in DataFrame
+#       type - Event type to extracting
+#       filename - file that was loaded in df
+#       numCount - Count of minimum number of events that should be saved after processing and grouping
+def processGenericEvent(df, type, fileName, numCount):
     try:
-        df = df[df.type.isin('WatchEvent')]
+        df = df[df.type.isin(type)]
     except:
-        print('extracting rows with WatchEvent Failed')
+        print('extracting rows with ', type, ' Failed')
     try:
         df=df.withColumn('event', df['type']).withColumn('create_time', df['created_at']).withColumn('repo_name', df['repo']['name'])
     except:
-        print('extracting WatchEvent columns Failed')
+        print('extracting ', type , ' columns Failed')
     try:
         df = df.select('event', 'create_time', 'repo_name')
     except:
-        print('selecting WatchEvent cols Failed')
-    print("*************", df.head())
+        print('selecting ',  type, ' cols Failed')
+        print("*************", df.head())
+    df = df.groupBy('event', 'repo_name').count()
+    df = df.filter(df['count'] > numCount)
+    str = fileName.split('.')[-2].split('-')[-1]
+    print("------------------" + str)
+    if int(str) != 23:
+        filestr = fileName.split('.')[-2]
+        try:
+            df.write.csv(type + filestr + ".csv")
+        except:
+            print("file " + type + filestr + ".csv" + "already exists")
     return df
 
-def processStarEvent(df):
-    try:
-        df = df[df.type.isin('StarEvent')]
-    except:
-        print('extracting rows with StarEvent Failed')
-    try:
-        df=df.withColumn('event', df['type']).withColumn('create_time', df['created_at']).withColumn('repo_name', df['repo']['name'])
-    except:
-        print('extracting StarEvent columns Failed')
-    try:
-        df = df.select('event', 'create_time', 'repo_name')
-    except:
-        print('selecting StarEvent cols Failed')
-    print("&&&&&&&&", df.head())
-    return df
+def processAggregateScore(df1, df2, df3, df4, fileName):
+    df1_max = df1.agg({"count": "max"}).collect()[0][0]
+    df1 = df1.withColumn("count", col("count")/df1_max)
+    df2_max = df2.agg({"count": "max"}).collect()[0][0]
+    df2 = df2.withColumn("count", col("count")/df2_max)
+    df3_max = df3.agg({"count": "max"}).collect()[0][0]
+    df3 = df3.withColumn("count", col("count")/df3_max)
+    df_comb = df1.union(df2).union(df3)
+    df_result = df_comb.groupBy('repo_name').agg(func.sum("count")/3)
+    df_result = df_result.withColumnRenamed('(sum(count) / 3)', 'score')
+    date_stored=fileName.split('.')[-2][:-3]
+    df_result = df_result.withColumn('create_date', lit(date_stored))
+    df_result = df_result.withColumn('create_date', df_result["create_date"].cast(DateType()))
+    writeUsersToPostgres(df_result, "AggregateEvent_table", "append")
+    df_repo_results = df_result.join(df4, on='repo_name', how='inner').drop('count')
+    writeUsersToPostgres(df_repo_results, "repo_details", "append")
 
 def writeUsersToPostgres(df, table, mode):
     conn.write(df, table, mode)
 
+
 if __name__=="__main__":
     ss = initSession()
     conn = initDbConnection()
-    hour = 2
-    df = ss.read.json("s3a://ritu-insight-project/2019-05-01-{}.json".format(hour))
-    #df = ss.read.json("/Users/ritu/Downloads/2019-01-15-15.json")
-    df_push = processPushEvent(df)
-    df_users = df_push.drop('event')
-    #writeUsersToPostgres(df_users, "repo_users", "overwrite")
-    writeUsersToPostgres(df_users, "repo_users", "append")
+    input_path = 's3a://ritu-insight-project/'
+    year = 2019
+    month = '05'
+    parser = ArgumentParser()
+    parser.add_argument("-y", "--year", help="Please enter a four digit year.", required=True)
+    parser.add_argument("-m", "--month", help="Please enter a two digit month.", required=True)
+    #parser.add_argument("-d", "--day", help="Please enter a two digit date_stored.", required=True)
 
-    df_push = df_push.drop('user_name')
-    df_watch = processWatchEvent(df)
-    df_star = processStarEvent(df)
-    writeUsersToPostgres(df_push, "repo_events", "append")
-    writeUsersToPostgres(df_watch, "repo_events", "append")
-    writeUsersToPostgres(df_star, "repo_events", "append")
+
+    args = parser.parse_args()
+    if len(args.year) != 4:
+        raise Exception("Please enter a four digit year. Ex: '2015'")
+
+    if len(args.month) != 2:
+        raise Exception("Please enter a two digit month between 01 and 12.")
+    #if len(args.day) != 2:
+        #raise Exception("Please enter a two digit day between 01 and 31.")
+
+    #dd = args.day
+    for i in range(1, 32):
+        for j in range(1, 24):
+            filepath = '{}-{}-{}/'.format(args.year, args.month, '{:02}'.format(i))
+            fileName = '{}-{}-{}-{}.json'.format(args.year, args.month, '{:02}'.format(i), j)
+            #print(filepath)
+            #print(fileName)
+            print(input_path+filepath+fileName)
+            #df = ss.read.json("s3a://ritu-insight-project/2019-03-01/2019-03-01-{}.json".format(hour))
+            df = ss.read.json(input_path + filepath + fileName)
+            hour=15
+            #df = ss.read.json("/Users/ritu/Downloads/2019-05-01-15.json")
+            #fileName = "2019-05-01-{}.json".format(hour)
+
+            processPushEventUsers(df, fileName)
+            df_push = processGenericEvent(df, "PushEvent", fileName, 10)
+            df_watch = processGenericEvent(df, "WatchEvent", fileName, 5)
+            df_fork = processGenericEvent(df, "ForkEvent", fileName, 4)
+            df_pull = processPullRequestEvent(df, fileName)
+            if getHour(fileName) == 23:
+                df_push_comb = processDayEnd(df_push, "PushEvent", fileName, 10)
+                df_watch_comb = processDayEnd(df_watch, "WatchEvent", fileName, 5)
+                df_fork_comb = processDayEnd(df_fork, "ForkEvent", fileName, 4)
+                processAggregateScore(df_push_comb, df_watch_comb, df_fork_comb, df_pull, fileName)
+                os.system("rm -rf PushEvent*.csv")
+                os.system("rm -rf WatchEvent*.csv")
+                os.system("rm -rf ForkEvent*.csv")
+                os.system("rm -rf PushEventUser*.csv")
+                os.system("rm -rf PullReqEvent*.json")
+
+
     ss.stop()
