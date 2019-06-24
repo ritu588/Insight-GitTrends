@@ -9,6 +9,18 @@ from pyspark.sql import functions as func
 from pyspark.sql.functions import lit, to_date, col, when
 
 import pgConnector
+user_schema_list = [
+            ('repo_name', 'STRING'),
+            ('user_name', 'STRING'),
+            ('count', 'INT'),
+        ]
+user_schema = ", ".join(["{} {}".format(col, type) for col, type in user_schema_list])
+event_schema_list = [
+            ('events', 'STRING'),
+            ('repo_name', 'STRING'),
+            ('count', 'INT'),
+        ]
+event_schema = ", ".join(["{} {}".format(col, type) for col, type in event_schema_list])
 
 input_path = 's3a://ritu-insight-project/'
 
@@ -28,9 +40,7 @@ def getHour(filename):
 # grouped together
 def processDayEnd(df, type, fileName, numCount):
         filestoread=fileName.split('.')[-2][:-3]
-        df_read = ss.read.csv(type + filestoread + "*.csv")
-        newcolnames = ['events','repo_name','count']
-        df_read=df_read.toDF(*newcolnames)
+        df_read = ss.read.csv(type + filestoread + "*.csv", header=True, schema=event_schema)
         df_read = df_read.withColumn('count', df_read["count"].cast(IntegerType()))
         df_combine = df.union(df_read)
         df_combine = df_combine.groupBy("event", "repo_name").agg(func.sum("count"))
@@ -76,7 +86,6 @@ def processPullRequestEvent(df, fileName):
     df = df.drop('repo')
 
     df = df.where(col("language").isNotNull())
-    #df = df.dropDuplicates(['repo_name']) #THIS SHOULD CHANGE, AGG LANGUAGE
 
     df_agg_langs = df.select('repo_name', 'language').dropDuplicates().groupby("repo_name").agg(func.collect_list("language").alias("languages"))
     df_agg = df.join(df_agg_langs, on='repo_name', how='inner').drop('language')
@@ -85,7 +94,6 @@ def processPullRequestEvent(df, fileName):
         df_agg.write.json("PullReqEvent" + filestr + ".json")
     except:
         print("file PullReqEvent" + filestr + ".json" + "already exists")
-
     str = getHour(fileName)
     if str == 23:
         filestoread=fileName.split('.')[-2][:-3]
@@ -122,9 +130,7 @@ def processPushEventUsers(df, fileName):
 
     else:
         filestoread=fileName.split('.')[-2][:-3]
-        df_read = ss.read.csv("PushEventUser" + filestoread + "*.csv")
-        newcolnames = ['repo_name','user_name', 'count']
-        df_read=df_read.toDF(*newcolnames)
+        df_read = ss.read.csv("PushEventUser" + filestoread + "*.csv", header=True, schema=user_schema)
         df_read = df_read.withColumn('count', df_read["count"].cast(IntegerType()))
         df_combine = df.union(df_read)
         df_combine = df_combine.groupBy("repo_name", "user_name").agg(func.sum("count"))
@@ -154,11 +160,9 @@ def processGenericEvent(df, type, fileName, numCount):
         df = df.select('event', 'create_time', 'repo_name')
     except:
         print('selecting ',  type, ' cols Failed')
-        print("*************", df.head())
     df = df.groupBy('event', 'repo_name').count()
     df = df.filter(df['count'] > numCount)
     str = fileName.split('.')[-2].split('-')[-1]
-    print("------------------" + str)
     if int(str) != 23:
         filestr = fileName.split('.')[-2]
         try:
@@ -197,7 +201,6 @@ if __name__=="__main__":
     parser = ArgumentParser()
     parser.add_argument("-y", "--year", help="Please enter a four digit year.", required=True)
     parser.add_argument("-m", "--month", help="Please enter a two digit month.", required=True)
-    #parser.add_argument("-d", "--day", help="Please enter a two digit date_stored.", required=True)
 
 
     args = parser.parse_args()
@@ -206,22 +209,14 @@ if __name__=="__main__":
 
     if len(args.month) != 2:
         raise Exception("Please enter a two digit month between 01 and 12.")
-    #if len(args.day) != 2:
-        #raise Exception("Please enter a two digit day between 01 and 31.")
 
-    #dd = args.day
     for i in range(1, 32):
         for j in range(1, 24):
             filepath = '{}-{}-{}/'.format(args.year, args.month, '{:02}'.format(i))
             fileName = '{}-{}-{}-{}.json'.format(args.year, args.month, '{:02}'.format(i), j)
-            #print(filepath)
-            #print(fileName)
             print(input_path+filepath+fileName)
-            #df = ss.read.json("s3a://ritu-insight-project/2019-03-01/2019-03-01-{}.json".format(hour))
             df = ss.read.json(input_path + filepath + fileName)
             hour=15
-            #df = ss.read.json("/Users/ritu/Downloads/2019-05-01-15.json")
-            #fileName = "2019-05-01-{}.json".format(hour)
 
             processPushEventUsers(df, fileName)
             df_push = processGenericEvent(df, "PushEvent", fileName, 10)
@@ -238,6 +233,4 @@ if __name__=="__main__":
                 os.system("rm -rf ForkEvent*.csv")
                 os.system("rm -rf PushEventUser*.csv")
                 os.system("rm -rf PullReqEvent*.json")
-
-
     ss.stop()
