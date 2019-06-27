@@ -22,7 +22,7 @@ event_schema_list = [
         ]
 event_schema = ", ".join(["{} {}".format(col, type) for col, type in event_schema_list])
 
-input_path = 's3a://ritu-insight-project/'
+input_path = 's3a://bucket/'
 
 def initSession():
     ss = SparkSession.builder.appName("MonthlyUploadAgg")\
@@ -171,6 +171,12 @@ def processGenericEvent(df, type, fileName, numCount):
             print("file " + type + filestr + ".csv" + "already exists")
     return df
 
+# Calculate the aggregate score for three types of events, save it
+# to database, find repository information for repositories in This
+# table and store that in the repo_details table
+#  df1, df2, df3 - three event dataframes
+#  df4 - repo detals DataFrame
+#  fileName - fileName to extract the date information
 def processAggregateScore(df1, df2, df3, df4, fileName):
     df1_max = df1.agg({"count": "max"}).collect()[0][0]
     df1 = df1.withColumn("count", col("count")/df1_max)
@@ -195,9 +201,7 @@ def writeUsersToPostgres(df, table, mode):
 if __name__=="__main__":
     ss = initSession()
     conn = initDbConnection()
-    input_path = 's3a://ritu-insight-project/'
-    year = 2019
-    month = '05'
+    input_path = 's3a://bucket/'
     parser = ArgumentParser()
     parser.add_argument("-y", "--year", help="Please enter a four digit year.", required=True)
     parser.add_argument("-m", "--month", help="Please enter a two digit month.", required=True)
@@ -216,13 +220,13 @@ if __name__=="__main__":
             fileName = '{}-{}-{}-{}.json'.format(args.year, args.month, '{:02}'.format(i), j)
             print(input_path+filepath+fileName)
             df = ss.read.json(input_path + filepath + fileName)
-            hour=15
 
             processPushEventUsers(df, fileName)
             df_push = processGenericEvent(df, "PushEvent", fileName, 10)
             df_watch = processGenericEvent(df, "WatchEvent", fileName, 5)
             df_fork = processGenericEvent(df, "ForkEvent", fileName, 4)
             df_pull = processPullRequestEvent(df, fileName)
+            #end of the day then aggregate the data and store in database
             if getHour(fileName) == 23:
                 df_push_comb = processDayEnd(df_push, "PushEvent", fileName, 10)
                 df_watch_comb = processDayEnd(df_watch, "WatchEvent", fileName, 5)
