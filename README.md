@@ -12,11 +12,9 @@ Trends Displayed:
 - Repository details
 
 ##### TechStack
-- S3
-- Spark
-- PostGres
-- AirFlow
-- Dash
+
+<img width="891" alt="Screen Shot 2019-06-28 at 1 21 09 PM" src="https://user-images.githubusercontent.com/38793306/60369454-8d8e9d00-99a8-11e9-880c-9b08326443ac.png">
+
 
 ##### Engineering Challenge 
 - Bringing in large amounts of gihub data into AWS
