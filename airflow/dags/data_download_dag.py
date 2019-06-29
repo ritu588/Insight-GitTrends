@@ -19,31 +19,31 @@ default_args = {
     'start_date': datetime(2019, 06, 27),
     'email_on_failure': False,
     'email_on_retry': False,
-    'schedule_interval': timedelta(minutes=60),
+    'schedule_interval': '10 */1 * * *',
     'retries': 1,
-    'retry_delay': timedelta(minutes=2),
+    'retry_delay': timedelta(minutes=5),
 }
 
 #initial dag object
 dag = DAG(
-  dag_id='data_manipulation_dagv2',
+  schedule_interval='10 */1 * * *',
+  dag_id='data_download_dag',
   description='data download from github archive -> extract and save to s3',
   default_args=default_args)
 
 #step1 data download
-data_manipulationv2 = BashOperator(
-  task_id='data_manipulationv2',
+data_download = BashOperator(
+  task_id='data_download',
   bash_command='python /home/ubuntu/hourly_download.py',
   dag = dag)
 
 #step2 data processing
-spark_path = '/usr/local/spark/bin/spark-submit '
-new_path = '/home/ubuntu/hourly_run.sh'
+spark_path = '/usr/local/spark/bin/spark_submit '
 spark_command = spark_path + '--packages org.postgresql:postgresql:9.4.1208 /home/ubuntu/HourlyUpload.py'
-spark_masterv2 = SSHOperator(
-  ssh_conn_id='ssh_default',
-  task_id='spark_masterv2',
-  command=spark_command,
+spark_master = SSHOperator(
+  ssh_conn_id='ssh_default'
+  task_id='spark_master',
+  bash_command=spark_command,
   dag = dag)
 
-data_manipulationv2 >> spark_masterv2
+ data_download >> spark_master
